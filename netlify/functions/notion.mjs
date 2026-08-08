@@ -20,6 +20,7 @@ const subjectFromPage = Object.fromEntries(
   ])
 );
 const SUBJECTS_DATA_SOURCE_ID = "8a04720a-3ccd-4497-a05c-01af1c59f3ea";
+const MAX_PUBLIC_PDF_BYTES = 4 * 1024 * 1024;
 
 const json = (status, body) => ({
   statusCode: status,
@@ -61,6 +62,32 @@ async function notion(path, method, payload) {
     throw new Error(body.message || "Notion no pudo guardar el cambio.");
   }
 
+  return body;
+}
+
+async function sendFileToNotion(uploadId, bytes, filename) {
+  const form = new FormData();
+  form.append(
+    "file",
+    new Blob([bytes], { type: "application/pdf" }),
+    filename
+  );
+
+  const response = await fetch(
+    `${NOTION_API}/file_uploads/${uploadId}/send`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
+        "Notion-Version": NOTION_VERSION
+      },
+      body: form
+    }
+  );
+  const body = await response.json();
+  if (!response.ok) {
+    throw new Error(body.message || "Notion no pudo recibir el PDF.");
+  }
   return body;
 }
 
@@ -130,13 +157,92 @@ function gradeFromPage(page) {
   };
 }
 
+function resourceFromPage(page) {
+  const properties = page.properties || {};
+  const subject = relatedSubject(properties["Asignatura"]);
+  const file = properties["Archivo"]?.files?.[0];
+  const url = file?.file?.url || file?.external?.url || "";
+  if (!subject || !url) return null;
+
+  return {
+    id: page.id,
+    notionId: page.id,
+    subject,
+    name: file.name || plainText(properties["Recurso"]) || "Documento.pdf",
+    url,
+    addedAt: page.created_time,
+    notes: plainText(properties["Notas"])
+  };
+}
+
+async function uploadSharedPdf(data) {
+  if (!process.env.NOTION_RESOURCES_DATA_SOURCE_ID) {
+    throw new Error("Falta configurar la biblioteca compartida.");
+  }
+  if (!subjectPages[data.subject]) {
+    throw new Error("Asignatura no reconocida.");
+  }
+
+  const filename = String(data.name || "documento.pdf")
+    .replace(/[^\p{L}\p{N}._ -]/gu, "_")
+    .slice(0, 180);
+  if (!filename.toLowerCase().endsWith(".pdf")) {
+    throw new Error("Solo se permiten archivos PDF.");
+  }
+
+  const match = String(data.content || "").match(
+    /^data:application\/pdf;base64,([A-Za-z0-9+/=]+)$/
+  );
+  if (!match) {
+    throw new Error("El archivo no es un PDF válido.");
+  }
+  const bytes = Buffer.from(match[1], "base64");
+  if (!bytes.length || bytes.length > MAX_PUBLIC_PDF_BYTES) {
+    throw new Error("El PDF debe pesar como máximo 4 MB.");
+  }
+  if (bytes.subarray(0, 5).toString() !== "%PDF-") {
+    throw new Error("El contenido no corresponde a un PDF válido.");
+  }
+
+  const upload = await notion("/file_uploads", "POST", {
+    mode: "single_part",
+    filename,
+    content_type: "application/pdf"
+  });
+  await sendFileToNotion(upload.id, bytes, filename);
+
+  return notion("/pages", "POST", {
+    parent: {
+      type: "data_source_id",
+      data_source_id: process.env.NOTION_RESOURCES_DATA_SOURCE_ID
+    },
+    properties: {
+      "Recurso": title(filename),
+      "Asignatura": relation(data.subject),
+      "Categoría": { select: { name: "Otro" } },
+      "Estado": { select: { name: "En uso" } },
+      "Notas": text("PDF compartido desde Ecosistema Paolo"),
+      "Archivo": {
+        files: [
+          {
+            type: "file_upload",
+            file_upload: { id: upload.id },
+            name: filename
+          }
+        ]
+      }
+    }
+  });
+}
+
 async function sharedState() {
-  const [taskPages, gradePages, subjectPageList] = await Promise.all([
+  const [taskPages, gradePages, subjectPageList, resourcePages] = await Promise.all([
     queryAll(process.env.NOTION_TASKS_DATA_SOURCE_ID),
     queryAll(process.env.NOTION_GRADES_DATA_SOURCE_ID),
     queryAll(
       process.env.NOTION_SUBJECTS_DATA_SOURCE_ID || SUBJECTS_DATA_SOURCE_ID
-    )
+    ),
+    queryAll(process.env.NOTION_RESOURCES_DATA_SOURCE_ID)
   ]);
 
   const subjectNotes = {};
@@ -151,6 +257,7 @@ async function sharedState() {
   return {
     tasks: taskPages.map(taskFromPage).filter(Boolean),
     grades: gradePages.map(gradeFromPage).filter(Boolean),
+    resources: resourcePages.map(resourceFromPage).filter(Boolean),
     subjectNotes,
     updatedAt: new Date().toISOString()
   };
@@ -178,7 +285,8 @@ export const handler = async event => {
     try {
       if (
         !process.env.NOTION_TASKS_DATA_SOURCE_ID ||
-        !process.env.NOTION_GRADES_DATA_SOURCE_ID
+        !process.env.NOTION_GRADES_DATA_SOURCE_ID ||
+        !process.env.NOTION_RESOURCES_DATA_SOURCE_ID
       ) {
         return json(500, {
           error: "Faltan las bases compartidas de Notion."
@@ -194,6 +302,28 @@ export const handler = async event => {
     }
   }
 
+  let request;
+  try {
+    request = JSON.parse(event.body || "{}");
+  } catch {
+    return json(400, { error: "Solicitud no válida." });
+  }
+
+  if (request.action === "uploadPdf") {
+    try {
+      const page = await uploadSharedPdf(request.data || {});
+      return json(200, {
+        ok: true,
+        notionId: page.id,
+        url: page.url
+      });
+    } catch (error) {
+      return json(400, {
+        error: error.message || "No se pudo compartir el PDF."
+      });
+    }
+  }
+
   if (!secure(event)) {
     return json(401, {
       error: "Introduce la clave de edición para sincronizar."
@@ -201,7 +331,7 @@ export const handler = async event => {
   }
 
   try {
-    const { action, data = {} } = JSON.parse(event.body || "{}");
+    const { action, data = {} } = request;
     let page;
 
     if (action === "createTask") {
