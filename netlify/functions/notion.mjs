@@ -13,14 +13,25 @@ const subjectPages = {
   ss: "3b6882dc-d26d-811a-939a-ce3e80717123"
 };
 
-const json = (status, body) => ({
-  statusCode: status,
-  headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
-  body: JSON.stringify(body)
+const json = (status, body) =>
+  Response.json(body, {
+    status,
+    headers: { "Cache-Control": "no-store" }
+  });
+
+const title = value => ({
+  title: [{ type: "text", text: { content: String(value).slice(0, 2000) } }]
 });
-const title = value => ({ title: [{ type: "text", text: { content: String(value).slice(0, 2000) } }] });
-const text = value => ({ rich_text: value ? [{ type: "text", text: { content: String(value).slice(0, 2000) } }] : [] });
-const relation = subject => ({ relation: subjectPages[subject] ? [{ id: subjectPages[subject] }] : [] });
+
+const text = value => ({
+  rich_text: value
+    ? [{ type: "text", text: { content: String(value).slice(0, 2000) } }]
+    : []
+});
+
+const relation = subject => ({
+  relation: subjectPages[subject] ? [{ id: subjectPages[subject] }] : []
+});
 
 async function notion(path, method, payload) {
   const response = await fetch(`${NOTION_API}${path}`, {
@@ -32,59 +43,123 @@ async function notion(path, method, payload) {
     },
     body: payload ? JSON.stringify(payload) : undefined
   });
+
   const body = await response.json();
-  if (!response.ok) throw new Error(body.message || "Notion no pudo guardar el cambio.");
+
+  if (!response.ok) {
+    throw new Error(body.message || "Notion no pudo guardar el cambio.");
+  }
+
   return body;
 }
 
-function secure(event) {
-  const supplied = event.headers["x-ecosystem-key"] || event.headers["X-Ecosystem-Key"];
-  return process.env.ADMIN_PASSWORD && supplied === process.env.ADMIN_PASSWORD;
+function secure(request) {
+  const supplied = request.headers.get("x-ecosystem-key");
+
+  return process.env.ADMIN_PASSWORD &&
+    supplied === process.env.ADMIN_PASSWORD;
 }
 
-export default async event => {
-  if (event.httpMethod !== "POST") return json(405, { error: "Método no permitido" });
-  if (!process.env.NOTION_TOKEN) return json(500, { error: "Falta configurar NOTION_TOKEN." });
-  if (!secure(event)) return json(401, { error: "Introduce la clave de edición para sincronizar." });
+export default async request => {
+  if (request.method !== "POST") {
+    return json(405, { error: "Método no permitido" });
+  }
+
+  if (!process.env.NOTION_TOKEN) {
+    return json(500, { error: "Falta configurar NOTION_TOKEN." });
+  }
+
+  if (!secure(request)) {
+    return json(401, {
+      error: "Introduce la clave de edición para sincronizar."
+    });
+  }
 
   try {
-    const { action, data = {} } = JSON.parse(event.body || "{}");
+    const { action, data = {} } = await request.json();
     let page;
+
     if (action === "createTask") {
-      const type = ["Tarea", "Práctica", "Parcial", "Examen", "Recordatorio"].includes(data.type) ? data.type : "Tarea";
+      const type = [
+        "Tarea",
+        "Práctica",
+        "Parcial",
+        "Examen",
+        "Recordatorio"
+      ].includes(data.type) ? data.type : "Tarea";
+
       page = await notion("/pages", "POST", {
-        parent: { type: "data_source_id", data_source_id: process.env.NOTION_TASKS_DATA_SOURCE_ID },
+        parent: {
+          type: "data_source_id",
+          data_source_id: process.env.NOTION_TASKS_DATA_SOURCE_ID
+        },
         properties: {
-          "Título": title(data.title), "Asignatura": relation(data.subject), "Tipo": { select: { name: type } },
-          "Fecha": { date: { start: data.date } }, "Estado": { status: { name: data.done ? "Listo" : "Sin empezar" } },
-          "Prioridad": { select: { name: "Media" } }, "Descripción": text(data.description), "Completada": { checkbox: Boolean(data.done) }
+          "Título": title(data.title),
+          "Asignatura": relation(data.subject),
+          "Tipo": { select: { name: type } },
+          "Fecha": { date: { start: data.date } },
+          "Estado": {
+            status: { name: data.done ? "Listo" : "Sin empezar" }
+          },
+          "Prioridad": { select: { name: "Media" } },
+          "Descripción": text(data.description),
+          "Completada": { checkbox: Boolean(data.done) }
         }
       });
     } else if (action === "updateTask") {
-      page = await notion(`/pages/${data.notionId}`, "PATCH", { properties: {
-        "Completada": { checkbox: Boolean(data.done) }, "Estado": { status: { name: data.done ? "Listo" : "Sin empezar" } }
-      }});
+      page = await notion(`/pages/${data.notionId}`, "PATCH", {
+        properties: {
+          "Completada": { checkbox: Boolean(data.done) },
+          "Estado": {
+            status: { name: data.done ? "Listo" : "Sin empezar" }
+          }
+        }
+      });
     } else if (action === "archiveTask" || action === "archiveGrade") {
-      page = await notion(`/pages/${data.notionId}`, "PATCH", { in_trash: true });
+      page = await notion(`/pages/${data.notionId}`, "PATCH", {
+        in_trash: true
+      });
     } else if (action === "createGrade") {
       page = await notion("/pages", "POST", {
-        parent: { type: "data_source_id", data_source_id: process.env.NOTION_GRADES_DATA_SOURCE_ID },
+        parent: {
+          type: "data_source_id",
+          data_source_id: process.env.NOTION_GRADES_DATA_SOURCE_ID
+        },
         properties: {
-          "Evaluación": title(data.name), "Asignatura": relation(data.subject), "Tipo": { select: { name: "Práctica" } },
-          "Nota": { number: Number(data.score) }, "Sobre": { number: 10 }, "Peso (%)": { number: Number(data.weight) }
+          "Evaluación": title(data.name),
+          "Asignatura": relation(data.subject),
+          "Tipo": { select: { name: "Práctica" } },
+          "Nota": { number: Number(data.score) },
+          "Sobre": { number: 10 },
+          "Peso (%)": { number: Number(data.weight) }
         }
       });
     } else if (action === "createResource") {
       page = await notion("/pages", "POST", {
-        parent: { type: "data_source_id", data_source_id: process.env.NOTION_RESOURCES_DATA_SOURCE_ID },
+        parent: {
+          type: "data_source_id",
+          data_source_id: process.env.NOTION_RESOURCES_DATA_SOURCE_ID
+        },
         properties: {
-          "Recurso": title(data.name), "Asignatura": relation(data.subject), "Categoría": { select: { name: "Otro" } },
-          "Estado": { select: { name: "En uso" } }, "Notas": text(data.notes)
+          "Recurso": title(data.name),
+          "Asignatura": relation(data.subject),
+          "Categoría": { select: { name: "Otro" } },
+          "Estado": { select: { name: "En uso" } },
+          "Notas": text(data.notes)
         }
       });
-    } else return json(400, { error: "Acción no reconocida" });
-    return json(200, { ok: true, notionId: page.id, url: page.url });
+    } else {
+      return json(400, { error: "Acción no reconocida" });
+    }
+
+    return json(200, {
+      ok: true,
+      notionId: page.id,
+      url: page.url
+    });
   } catch (error) {
-    return json(500, { error: error.message || "No se pudo sincronizar con Notion." });
+    return json(500, {
+      error: error.message || "No se pudo sincronizar con Notion."
+    });
   }
 };
