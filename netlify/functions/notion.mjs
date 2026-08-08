@@ -13,6 +13,14 @@ const subjectPages = {
   ss: "3b6882dc-d26d-811a-939a-ce3e80717123"
 };
 
+const subjectFromPage = Object.fromEntries(
+  Object.entries(subjectPages).map(([subject, pageId]) => [
+    pageId.replaceAll("-", "").toLowerCase(),
+    subject
+  ])
+);
+const SUBJECTS_DATA_SOURCE_ID = "8a04720a-3ccd-4497-a05c-01af1c59f3ea";
+
 const json = (status, body) => ({
   statusCode: status,
   headers: {
@@ -56,6 +64,98 @@ async function notion(path, method, payload) {
   return body;
 }
 
+async function queryAll(dataSourceId) {
+  const results = [];
+  let cursor;
+
+  do {
+    const page = await notion(`/data_sources/${dataSourceId}/query`, "POST", {
+      page_size: 100,
+      ...(cursor ? { start_cursor: cursor } : {})
+    });
+    results.push(...page.results);
+    cursor = page.has_more ? page.next_cursor : undefined;
+  } while (cursor);
+
+  return results;
+}
+
+const plainText = property => {
+  const values = property?.title || property?.rich_text || [];
+  return values
+    .map(value => value.plain_text || value.text?.content || "")
+    .join("");
+};
+
+const relatedSubject = property => {
+  const id = property?.relation?.[0]?.id
+    ?.replaceAll("-", "")
+    .toLowerCase();
+  return id ? subjectFromPage[id] || "" : "";
+};
+
+function taskFromPage(page) {
+  const properties = page.properties || {};
+  const subject = relatedSubject(properties["Asignatura"]);
+  const date = properties["Fecha"]?.date?.start?.slice(0, 10) || "";
+  if (!subject || !date) return null;
+
+  return {
+    id: page.id,
+    notionId: page.id,
+    title: plainText(properties["Título"]),
+    date,
+    type: properties["Tipo"]?.select?.name || "Tarea",
+    subject,
+    description: plainText(properties["Descripción"]),
+    done:
+      Boolean(properties["Completada"]?.checkbox) ||
+      properties["Estado"]?.status?.name === "Listo",
+    createdAt: page.created_time
+  };
+}
+
+function gradeFromPage(page) {
+  const properties = page.properties || {};
+  const subject = relatedSubject(properties["Asignatura"]);
+  if (!subject) return null;
+
+  return {
+    id: page.id,
+    notionId: page.id,
+    subject,
+    name: plainText(properties["Evaluación"]),
+    score: Number(properties["Nota"]?.number || 0),
+    weight: Number(properties["Peso (%)"]?.number || 0)
+  };
+}
+
+async function sharedState() {
+  const [taskPages, gradePages, subjectPageList] = await Promise.all([
+    queryAll(process.env.NOTION_TASKS_DATA_SOURCE_ID),
+    queryAll(process.env.NOTION_GRADES_DATA_SOURCE_ID),
+    queryAll(
+      process.env.NOTION_SUBJECTS_DATA_SOURCE_ID || SUBJECTS_DATA_SOURCE_ID
+    )
+  ]);
+
+  const subjectNotes = {};
+  subjectPageList.forEach(page => {
+    const subject =
+      subjectFromPage[page.id.replaceAll("-", "").toLowerCase()];
+    if (subject) {
+      subjectNotes[subject] = plainText(page.properties?.["Notas web"]);
+    }
+  });
+
+  return {
+    tasks: taskPages.map(taskFromPage).filter(Boolean),
+    grades: gradePages.map(gradeFromPage).filter(Boolean),
+    subjectNotes,
+    updatedAt: new Date().toISOString()
+  };
+}
+
 function secure(event) {
   const supplied =
     event.headers?.["x-ecosystem-key"] ||
@@ -66,12 +166,32 @@ function secure(event) {
 }
 
 export const handler = async event => {
-  if (event.httpMethod !== "POST") {
+  if (!["GET", "POST"].includes(event.httpMethod)) {
     return json(405, { error: "Método no permitido" });
   }
 
   if (!process.env.NOTION_TOKEN) {
     return json(500, { error: "Falta configurar NOTION_TOKEN." });
+  }
+
+  if (event.httpMethod === "GET") {
+    try {
+      if (
+        !process.env.NOTION_TASKS_DATA_SOURCE_ID ||
+        !process.env.NOTION_GRADES_DATA_SOURCE_ID
+      ) {
+        return json(500, {
+          error: "Faltan las bases compartidas de Notion."
+        });
+      }
+
+      return json(200, { ok: true, ...(await sharedState()) });
+    } catch (error) {
+      return json(500, {
+        error:
+          error.message || "No se pudo leer la información compartida."
+      });
+    }
   }
 
   if (!secure(event)) {
@@ -151,6 +271,18 @@ export const handler = async event => {
           "Categoría": { select: { name: "Otro" } },
           "Estado": { select: { name: "En uso" } },
           "Notas": text(data.notes)
+        }
+      });
+    } else if (action === "updateSubjectNotes") {
+      const subjectPage = subjectPages[data.subject];
+
+      if (!subjectPage) {
+        return json(400, { error: "Asignatura no reconocida" });
+      }
+
+      page = await notion(`/pages/${subjectPage}`, "PATCH", {
+        properties: {
+          "Notas web": text(data.notes)
         }
       });
     } else {
