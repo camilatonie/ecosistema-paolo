@@ -13,11 +13,14 @@ const subjectPages = {
   ss: "3b6882dc-d26d-811a-939a-ce3e80717123"
 };
 
-const json = (status, body) =>
-  Response.json(body, {
-    status,
-    headers: { "Cache-Control": "no-store" }
-  });
+const json = (status, body) => ({
+  statusCode: status,
+  headers: {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  body: JSON.stringify(body)
+});
 
 const title = value => ({
   title: [{ type: "text", text: { content: String(value).slice(0, 2000) } }]
@@ -53,15 +56,17 @@ async function notion(path, method, payload) {
   return body;
 }
 
-function secure(request) {
-  const supplied = request.headers.get("x-ecosystem-key");
+function secure(event) {
+  const supplied =
+    event.headers?.["x-ecosystem-key"] ||
+    event.headers?.["X-Ecosystem-Key"];
 
   return process.env.ADMIN_PASSWORD &&
     supplied === process.env.ADMIN_PASSWORD;
 }
 
-export default async request => {
-  if (request.method !== "POST") {
+export const handler = async event => {
+  if (event.httpMethod !== "POST") {
     return json(405, { error: "Método no permitido" });
   }
 
@@ -69,14 +74,14 @@ export default async request => {
     return json(500, { error: "Falta configurar NOTION_TOKEN." });
   }
 
-  if (!secure(request)) {
+  if (!secure(event)) {
     return json(401, {
       error: "Introduce la clave de edición para sincronizar."
     });
   }
 
   try {
-    const { action, data = {} } = await request.json();
+    const { action, data = {} } = JSON.parse(event.body || "{}");
     let page;
 
     if (action === "createTask") {
