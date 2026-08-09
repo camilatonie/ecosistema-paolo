@@ -154,14 +154,18 @@ function checksumFor(event) {
 }
 
 function descriptionFor(event) {
-  return [
+  const details = [
     event.DESCRIPTION,
     event.LOCATION ? `Lugar: ${event.LOCATION}` : "",
-    event.URL ? `Enlace: ${event.URL}` : "",
+    event.URL ? `Enlace: ${event.URL}` : ""
+  ].filter(Boolean).join("\n").slice(0, 1500);
+
+  return [
+    details,
     "Fuente: Campus Virtual · Blackboard",
     markerFor(event.UID),
     `Campus Checksum: ${checksumFor(event)}`
-  ].filter(Boolean).join("\n").slice(0, 2000);
+  ].filter(Boolean).join("\n");
 }
 
 function propertiesFor(event, subject, isNew = false) {
@@ -195,7 +199,7 @@ function isRelevant(event, today = new Date()) {
   return date >= earliest && date <= latest;
 }
 
-async function syncCampus() {
+export async function syncCampus() {
   const calendarUrl = process.env.BLACKBOARD_ICS_URL;
   const tasksId = process.env.NOTION_TASKS_DATA_SOURCE_ID;
   if (!calendarUrl || !tasksId || !process.env.NOTION_TOKEN) {
