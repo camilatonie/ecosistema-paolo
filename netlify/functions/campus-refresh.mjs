@@ -1,17 +1,20 @@
 import { syncCampus } from "./campus-sync.mjs";
 
-const json = (status, body) =>
-  Response.json(body, {
-    status,
-    headers: { "Cache-Control": "no-store" }
-  });
+const json = (status, body) => ({
+  statusCode: status,
+  headers: {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  body: JSON.stringify(body)
+});
 
-export default async request => {
-  if (request.method !== "POST") {
+export const handler = async event => {
+  if (event.httpMethod !== "POST") {
     return json(405, { error: "Método no permitido." });
   }
 
-  const supplied = request.headers.get("x-ecosystem-key");
+  const supplied = event.headers?.["x-ecosystem-key"];
   if (!process.env.ADMIN_PASSWORD || supplied !== process.env.ADMIN_PASSWORD) {
     return json(401, { error: "Introduce la clave de edición para actualizar el Campus." });
   }
@@ -23,15 +26,5 @@ export default async request => {
     return json(500, {
       error: error.message || "No se pudo actualizar el Campus Virtual."
     });
-  }
-};
-
-export const config = {
-  path: "/api/campus/refresh",
-  method: "POST",
-  rateLimit: {
-    windowLimit: 6,
-    windowSize: 3600,
-    aggregateBy: ["domain", "ip"]
   }
 };
