@@ -291,6 +291,7 @@ async function uploadSharedPdfToDrive(data) {
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify({
       secret: process.env.DRIVE_SYNC_SECRET,
+      action: "uploadPdf",
       name: data.name,
       subject: data.subject,
       category: data.category,
@@ -301,6 +302,27 @@ async function uploadSharedPdfToDrive(data) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok || !body.ok) {
     throw new Error(body.error || "Google Drive no pudo guardar el PDF.");
+  }
+  return body;
+}
+
+async function syncGoogleCalendar(action, data = {}) {
+  if (!process.env.GOOGLE_DRIVE_WEB_APP_URL || !process.env.DRIVE_SYNC_SECRET) {
+    throw new Error("Falta configurar la sincronización con Google Calendar.");
+  }
+
+  const response = await fetch(process.env.GOOGLE_DRIVE_WEB_APP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({
+      secret: process.env.DRIVE_SYNC_SECRET,
+      action,
+      ...data
+    })
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.ok) {
+    throw new Error(body.error || "Google Calendar no pudo sincronizar la fecha.");
   }
   return body;
 }
@@ -413,7 +435,23 @@ export const handler = async event => {
         });
       }
 
-      return json(200, { ok: true, ...(await sharedState()) });
+      const state = await sharedState();
+      let calendar;
+      let calendarError = "";
+      try {
+        calendar = await syncGoogleCalendar("calendarSyncAll", {
+          tasks: state.tasks
+        });
+      } catch (error) {
+        calendarError = error.message || "Google Calendar no pudo actualizarse.";
+      }
+      return json(200, {
+        ok: true,
+        ...state,
+        calendarSynced: Boolean(calendar),
+        calendarUrl: calendar?.calendarUrl || "",
+        calendarError
+      });
     } catch (error) {
       return json(500, {
         error:
@@ -464,6 +502,8 @@ export const handler = async event => {
   try {
     const { action, data = {} } = request;
     let page;
+    let calendar;
+    let calendarError = "";
 
     if (action === "createTask") {
       const type = [
@@ -493,6 +533,15 @@ export const handler = async event => {
           "Completada": { checkbox: Boolean(data.done) }
         }
       });
+      try {
+        calendar = await syncGoogleCalendar("calendarUpsert", {
+          ...data,
+          type,
+          notionId: page.id
+        });
+      } catch (error) {
+        calendarError = error.message || "Google Calendar no pudo guardar la fecha.";
+      }
     } else if (action === "updateTask") {
       page = await notion(`/pages/${data.notionId}`, "PATCH", {
         properties: {
@@ -524,6 +573,14 @@ export const handler = async event => {
           }
         }
       });
+      try {
+        calendar = await syncGoogleCalendar("calendarUpsert", {
+          ...data,
+          type
+        });
+      } catch (error) {
+        calendarError = error.message || "Google Calendar no pudo actualizar la fecha.";
+      }
     } else if (
       action === "archiveTask" ||
       action === "archiveGrade" ||
@@ -532,6 +589,15 @@ export const handler = async event => {
       page = await notion(`/pages/${data.notionId}`, "PATCH", {
         in_trash: true
       });
+      if (action === "archiveTask") {
+        try {
+          calendar = await syncGoogleCalendar("calendarDelete", {
+            notionId: data.notionId
+          });
+        } catch (error) {
+          calendarError = error.message || "Google Calendar no pudo retirar la fecha.";
+        }
+      }
     } else if (action === "createAcademicNote") {
       const kind = data.kind === "general" ? "general" : "sesion";
       const date = /^\d{4}-\d{2}-\d{2}$/.test(data.date || "")
@@ -643,7 +709,10 @@ export const handler = async event => {
     return json(200, {
       ok: true,
       notionId: page.id,
-      url: page.url
+      url: page.url,
+      calendarSynced: Boolean(calendar),
+      calendarUrl: calendar?.calendarUrl || "",
+      calendarError
     });
   } catch (error) {
     return json(500, {
