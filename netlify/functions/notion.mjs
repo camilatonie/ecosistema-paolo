@@ -121,6 +121,22 @@ const plainText = property => {
     .join("");
 };
 
+function subjectWebData(property) {
+  const raw = plainText(property);
+  if (!raw.startsWith("[[ECOSISTEMA_ASIGNATURA]]")) {
+    return { notes: raw, syllabus: "" };
+  }
+  try {
+    const data = JSON.parse(raw.replace("[[ECOSISTEMA_ASIGNATURA]]", ""));
+    return {
+      notes: String(data.notes || ""),
+      syllabus: String(data.syllabus || "")
+    };
+  } catch {
+    return { notes: "", syllabus: "" };
+  }
+}
+
 const relatedSubject = property => {
   const id = property?.relation?.[0]?.id
     ?.replaceAll("-", "")
@@ -132,7 +148,7 @@ function taskFromPage(page) {
   const properties = page.properties || {};
   const subject = relatedSubject(properties["Asignatura"]);
   const date = properties["Fecha"]?.date?.start?.slice(0, 10) || "";
-  if (!subject || !date) return null;
+  if (!date) return null;
 
   return {
     id: page.id,
@@ -196,7 +212,7 @@ function resourceFromPage(page) {
     id: page.id,
     notionId: page.id,
     subject,
-    name: file.name || plainText(properties["Recurso"]) || "Documento.pdf",
+    name: plainText(properties["Recurso"]) || file.name || "Documento.pdf",
     url,
     addedAt: page.created_time,
     category: properties["Categoría"]?.select?.name || "Otro",
@@ -265,6 +281,46 @@ async function uploadSharedPdf(data) {
   });
 }
 
+async function ensureSubjectNoteLink(subject, notePageId) {
+  const subjectPageId = subjectPages[subject];
+  if (!subjectPageId || !notePageId) return;
+  const children = await notion(
+    `/blocks/${subjectPageId}/children?page_size=100`,
+    "GET"
+  );
+  const hasHeading = children.results?.some(block =>
+    block.type === "heading_2" &&
+    plainText(block.heading_2) === "Notas de cada sesión"
+  );
+  const hasLink = children.results?.some(block =>
+    block.type === "link_to_page" &&
+    block.link_to_page?.page_id?.replaceAll("-", "") ===
+      notePageId.replaceAll("-", "")
+  );
+  if (hasLink) return;
+  await notion(`/blocks/${subjectPageId}/children`, "PATCH", {
+    children: [
+      ...(!hasHeading
+        ? [{
+            object: "block",
+            type: "heading_2",
+            heading_2: {
+              rich_text: [{
+                type: "text",
+                text: { content: "Notas de cada sesión" }
+              }]
+            }
+          }]
+        : []),
+      {
+        object: "block",
+        type: "link_to_page",
+        link_to_page: { type: "page_id", page_id: notePageId }
+      }
+    ]
+  });
+}
+
 async function sharedState() {
   const [taskPages, gradePages, subjectPageList, resourcePages] = await Promise.all([
     queryAll(process.env.NOTION_TASKS_DATA_SOURCE_ID),
@@ -276,11 +332,14 @@ async function sharedState() {
   ]);
 
   const subjectNotes = {};
+  const subjectSyllabi = {};
   subjectPageList.forEach(page => {
     const subject =
       subjectFromPage[page.id.replaceAll("-", "").toLowerCase()];
     if (subject) {
-      subjectNotes[subject] = plainText(page.properties?.["Notas web"]);
+      const data = subjectWebData(page.properties?.["Notas web"]);
+      subjectNotes[subject] = data.notes;
+      subjectSyllabi[subject] = data.syllabus;
     }
   });
 
@@ -295,6 +354,7 @@ async function sharedState() {
     grades: gradePages.map(gradeFromPage).filter(Boolean),
     resources: resourcePages.map(resourceFromPage).filter(Boolean),
     subjectNotes,
+    subjectSyllabi,
     updatedAt: new Date().toISOString()
   };
 }
@@ -407,6 +467,28 @@ export const handler = async event => {
           }
         }
       });
+    } else if (action === "updateTaskDetails") {
+      const type = [
+        "Tarea",
+        "Práctica",
+        "Parcial",
+        "Examen",
+        "Entrega",
+        "Recordatorio"
+      ].includes(data.type) ? data.type : "Tarea";
+      page = await notion(`/pages/${data.notionId}`, "PATCH", {
+        properties: {
+          "Título": title(data.title),
+          "Asignatura": relation(data.subject),
+          "Tipo": { select: { name: type } },
+          "Fecha": { date: { start: data.date } },
+          "Descripción": text(data.description),
+          "Completada": { checkbox: Boolean(data.done) },
+          "Estado": {
+            status: { name: data.done ? "Listo" : "Sin empezar" }
+          }
+        }
+      });
     } else if (
       action === "archiveTask" ||
       action === "archiveGrade" ||
@@ -438,6 +520,7 @@ export const handler = async event => {
           "Completada": { checkbox: true }
         }
       });
+      await ensureSubjectNoteLink(data.subject, page.id);
     } else if (action === "updateAcademicNote") {
       if (!data.notionId) {
         return json(400, { error: "No se encontró la nota que quieres editar." });
@@ -455,9 +538,11 @@ export const handler = async event => {
           )
         }
       });
+      await ensureSubjectNoteLink(data.subject, page.id);
     } else if (action === "updateResource") {
       page = await notion(`/pages/${data.notionId}`, "PATCH", {
         properties: {
+          "Recurso": title(data.name || "Documento.pdf"),
           "Categoría": { select: { name: data.category || "Otro" } },
           "Notas": text(`[[orden:${Number(data.order) || 9999}]] ${data.notes || ""}`)
         }
@@ -491,16 +576,29 @@ export const handler = async event => {
           "Notas": text(data.notes)
         }
       });
-    } else if (action === "updateSubjectNotes") {
+    } else if (
+      action === "updateSubjectNotes" ||
+      action === "updateSubjectSyllabus"
+    ) {
       const subjectPage = subjectPages[data.subject];
 
       if (!subjectPage) {
         return json(400, { error: "Asignatura no reconocida" });
       }
 
+      const currentPage = await notion(`/pages/${subjectPage}`, "GET");
+      const current = subjectWebData(currentPage.properties?.["Notas web"]);
+      if (action === "updateSubjectNotes") {
+        current.notes = String(data.notes || "");
+      } else {
+        current.syllabus = String(data.syllabus || "");
+      }
+
       page = await notion(`/pages/${subjectPage}`, "PATCH", {
         properties: {
-          "Notas web": text(data.notes)
+          "Notas web": longText(
+            `[[ECOSISTEMA_ASIGNATURA]]${JSON.stringify(current)}`
+          )
         }
       });
     } else {
