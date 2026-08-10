@@ -41,6 +41,13 @@ const text = value => ({
     : []
 });
 
+const longText = value => ({
+  rich_text: String(value || "")
+    .slice(0, 190000)
+    .match(/[\s\S]{1,1900}/g)
+    ?.map(content => ({ type: "text", text: { content } })) || []
+});
+
 const relation = subject => ({
   relation: subjectPages[subject] ? [{ id: subjectPages[subject] }] : []
 });
@@ -425,10 +432,27 @@ export const handler = async event => {
           "Fecha": { date: { start: date } },
           "Estado": { status: { name: "Listo" } },
           "Prioridad": { select: { name: "Media" } },
-          "Descripción": text(
+          "Descripción": longText(
             `[[ECOSISTEMA_NOTA]]\nTipo: ${kind}\n${data.content || ""}`
           ),
           "Completada": { checkbox: true }
+        }
+      });
+    } else if (action === "updateAcademicNote") {
+      if (!data.notionId) {
+        return json(400, { error: "No se encontró la nota que quieres editar." });
+      }
+      const kind = data.kind === "general" ? "general" : "sesion";
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(data.date || "")
+        ? data.date
+        : new Date().toISOString().slice(0, 10);
+      page = await notion(`/pages/${data.notionId}`, "PATCH", {
+        properties: {
+          "Título": title(data.title || "Nota"),
+          "Fecha": { date: { start: date } },
+          "Descripción": longText(
+            `[[ECOSISTEMA_NOTA]]\nTipo: ${kind}\n${data.content || ""}`
+          )
         }
       });
     } else if (action === "updateResource") {
