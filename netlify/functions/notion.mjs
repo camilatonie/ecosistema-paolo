@@ -281,6 +281,30 @@ async function uploadSharedPdf(data) {
   });
 }
 
+async function uploadSharedPdfToDrive(data) {
+  if (!process.env.GOOGLE_DRIVE_WEB_APP_URL || !process.env.DRIVE_SYNC_SECRET) {
+    throw new Error("Falta configurar la sincronización con Google Drive.");
+  }
+
+  const response = await fetch(process.env.GOOGLE_DRIVE_WEB_APP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({
+      secret: process.env.DRIVE_SYNC_SECRET,
+      name: data.name,
+      subject: data.subject,
+      category: data.category,
+      content: data.content
+    })
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.ok) {
+    throw new Error(body.error || "Google Drive no pudo guardar el PDF.");
+  }
+  return body;
+}
+
 async function ensureSubjectNoteLink(subject, notePageId) {
   const subjectPageId = subjectPages[subject];
   if (!subjectPageId || !notePageId) return;
@@ -407,11 +431,22 @@ export const handler = async event => {
 
   if (request.action === "uploadPdf") {
     try {
-      const page = await uploadSharedPdf(request.data || {});
+      const data = request.data || {};
+      const page = await uploadSharedPdf(data);
+      let drive;
+      let driveError;
+      try {
+        drive = await uploadSharedPdfToDrive(data);
+      } catch (error) {
+        driveError = error.message || "Google Drive no pudo guardar el PDF.";
+      }
       return json(200, {
         ok: true,
         notionId: page.id,
-        url: page.url
+        url: page.url,
+        driveSynced: Boolean(drive),
+        driveUrl: drive?.url || "",
+        driveError: driveError || ""
       });
     } catch (error) {
       return json(400, {
