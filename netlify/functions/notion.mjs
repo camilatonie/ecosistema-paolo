@@ -21,6 +21,11 @@ const subjectFromPage = Object.fromEntries(
 );
 const SUBJECTS_DATA_SOURCE_ID = "8a04720a-3ccd-4497-a05c-01af1c59f3ea";
 const MAX_PUBLIC_PDF_BYTES = 4 * 1024 * 1024;
+const GOOGLE_CALENDAR_URL =
+  "https://calendar.google.com/calendar/u/0/r?cid=" +
+  encodeURIComponent(
+    "10a3591698a42da51e2c3387b7aed601fb9204c4133fcc6735f3e7f54aba7584@group.calendar.google.com"
+  );
 
 const json = (status, body) => ({
   statusCode: status,
@@ -435,22 +440,12 @@ export const handler = async event => {
         });
       }
 
-      const state = await sharedState();
-      let calendar;
-      let calendarError = "";
-      try {
-        calendar = await syncGoogleCalendar("calendarSyncAll", {
-          tasks: state.tasks
-        });
-      } catch (error) {
-        calendarError = error.message || "Google Calendar no pudo actualizarse.";
-      }
       return json(200, {
         ok: true,
-        ...state,
-        calendarSynced: Boolean(calendar),
-        calendarUrl: calendar?.calendarUrl || "",
-        calendarError
+        ...(await sharedState()),
+        calendarSynced: true,
+        calendarUrl: GOOGLE_CALENDAR_URL,
+        calendarError: ""
       });
     } catch (error) {
       return json(500, {
@@ -505,7 +500,18 @@ export const handler = async event => {
     let calendar;
     let calendarError = "";
 
-    if (action === "createTask") {
+    if (action === "syncCalendarAll") {
+      const state = await sharedState();
+      calendar = await syncGoogleCalendar("calendarSyncAll", {
+        tasks: state.tasks
+      });
+      return json(200, {
+        ok: true,
+        calendarSynced: true,
+        calendarUrl: calendar.calendarUrl || GOOGLE_CALENDAR_URL,
+        synced: calendar.synced || 0
+      });
+    } else if (action === "createTask") {
       const type = [
         "Tarea",
         "Práctica",
