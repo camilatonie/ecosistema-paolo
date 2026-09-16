@@ -92,14 +92,16 @@ function parseIcsDate(value) {
   return `${year}-${month}-${day}T${hour}:${minute}:${second}${utc || ""}`;
 }
 
-function parseCalendar(source) {
+export function parseCalendar(source) {
   const lines = source.replace(/\r?\n[ \t]/g, "").split(/\r?\n/);
   const events = [];
   let event;
+  let nested = 0;
 
   for (const line of lines) {
     if (line === "BEGIN:VEVENT") {
       event = {};
+      nested = 0;
       continue;
     }
     if (line === "END:VEVENT") {
@@ -108,10 +110,13 @@ function parseCalendar(source) {
       continue;
     }
     if (!event) continue;
+    if (line.startsWith("BEGIN:")) { nested += 1; continue; }
+    if (line.startsWith("END:")) { nested -= 1; continue; }
+    if (nested) continue;
     const separator = line.indexOf(":");
     if (separator < 1) continue;
     const key = line.slice(0, separator).split(";")[0].toUpperCase();
-    if (!["UID", "SUMMARY", "DESCRIPTION", "DTSTART", "DTEND", "LOCATION", "URL"].includes(key)) {
+    if (!["UID", "SUMMARY", "DESCRIPTION", "DTSTART", "DTEND", "LOCATION", "URL", "CATEGORIES", "RECURRENCE-ID", "STATUS"].includes(key)) {
       continue;
     }
     event[key] = unescapeIcs(line.slice(separator + 1));
@@ -119,8 +124,11 @@ function parseCalendar(source) {
   return events;
 }
 
-function subjectFor(event) {
-  const haystack = [event.SUMMARY, event.DESCRIPTION, event.LOCATION].filter(Boolean).join(" ");
+export function subjectFor(event) {
+  const haystack = [event.SUMMARY, event.DESCRIPTION, event.LOCATION, event.CATEGORIES, event.URL].filter(Boolean).join(" ");
+  const codes = {1990001:"fis",1990002:"fc",1990003:"fp1",1990004:"m1",1990005:"m2",1990011:"af",1990012:"eb",1990013:"fi",1990015:"ss"};
+  const code = haystack.match(/\b19900\d{2}\b/)?.[0];
+  if (codes[code]) return codes[code];
   return subjectMatchers.find(([, matcher]) => matcher.test(haystack))?.[0] || "";
 }
 
@@ -143,7 +151,8 @@ function checksumFor(event) {
     event.DTEND,
     event.DESCRIPTION,
     event.LOCATION,
-    event.URL
+    event.URL,
+    event.CATEGORIES
   ].join("|");
   let hash = 2166136261;
   for (let index = 0; index < source.length; index += 1) {
@@ -168,12 +177,13 @@ function descriptionFor(event) {
   ].filter(Boolean).join("\n");
 }
 
-function propertiesFor(event, subject, isNew = false) {
+export function propertiesFor(event, subject, isNew = false) {
   const start = parseIcsDate(event.DTSTART);
   const end = parseIcsDate(event.DTEND);
   return {
     "Título": title(event.SUMMARY),
-    "Asignatura": { relation: [{ id: subjectPages[subject] }] },
+    // Keep unmatched events; do not erase a subject the user assigned manually.
+    ...(subjectPages[subject] ? {"Asignatura": { relation: [{ id: subjectPages[subject] }] }} : {}),
     "Tipo": { select: { name: typeFor(event.SUMMARY) } },
     "Fecha": { date: { start, ...(end ? { end } : {}) } },
     "Prioridad": { select: { name: /examen|parcial/i.test(event.SUMMARY) ? "Alta" : "Media" } },
@@ -226,16 +236,17 @@ export async function syncCampus() {
     if (uid) campusPages.set(uid, { page, checksum });
   }
 
-  const events = parseCalendar(calendarText).filter(event => isRelevant(event));
+  const parsed = parseCalendar(calendarText);
+  const events = parsed.filter(event => event.STATUS !== "CANCELLED" && isRelevant(event));
   let created = 0;
   let updated = 0;
   let skipped = 0;
+  let unclassified = 0;
 
   for (const event of events) {
     const subject = subjectFor(event);
     if (!subject) {
-      skipped += 1;
-      continue;
+      unclassified += 1;
     }
     const existing = campusPages.get(event.UID);
     if (existing) {
@@ -256,7 +267,10 @@ export async function syncCampus() {
     }
   }
 
-  return { scanned: events.length, created, updated, skipped };
+  return { scanned: events.length, created, updated, skipped, unclassified,
+    sourceEvents: parsed.length, scope: "calendar-only",
+    warning: "Solo se consulta el calendario de Blackboard. Los materiales y anuncios de las asignaturas no se importan mediante este enlace.",
+    checkedAt: new Date().toISOString() };
 }
 
 export default async () => {
